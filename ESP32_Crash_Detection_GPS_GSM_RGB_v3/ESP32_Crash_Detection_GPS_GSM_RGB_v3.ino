@@ -1273,7 +1273,7 @@
 //       }
 
 //     } else {
-//       Serial.println(F("[SMS] WARNING: no SMS transport available - no SMS sent"));
+//       Serial.println(F("[GSM] WARNING: modem unavailable - no SMS sent"));
 //     }
 //   } else {
 //     Serial.println(F("[GSM] Normal severity - no SMS required"));
@@ -1913,17 +1913,6 @@ const char* EMERGENCY_CONTACTS[] = {
 const uint8_t NUM_EMERGENCY_CONTACTS =
     sizeof(EMERGENCY_CONTACTS) / sizeof(EMERGENCY_CONTACTS[0]);
 
-// ─── SMS TRANSPORT ────────────────────────────────────────────
-// SMS_VIA_BACKEND: send SMS over WiFi. The ESP32 POSTs {phone, message} to
-// BACKEND_URL/api/v1/sms/send and the backend sends it through its SMS
-// provider (Arkesel/Twilio). Each number above must be allowed on the backend
-// (SMS_ALLOWED_RECIPIENTS, or a registered emergency contact of DEVICE_ID).
-// GSM_ENABLED: also bring up the SIM800L. Leave false while the module is
-// broken: it saves ~30 s of boot time and the modem is never touched. When
-// true, GSM is used only if the WiFi SMS path fails.
-#define SMS_VIA_BACKEND true
-#define GSM_ENABLED     false
-
 // Send SMS for these severities (NORMAL never triggers an SMS)
 #define SMS_ON_MODERATE true
 #define SMS_ON_SEVERE   true
@@ -2256,17 +2245,11 @@ void setup() {
   // Initialize GSM (Hardware UART1)
   // ─────────────────────────────────────────────────────────────
   Serial.println();
-#if GSM_ENABLED
   Serial.println(F("[GSM] Initializing SIM800L on Serial1..."));
   Serial1.begin(GSM_BAUD, SERIAL_8N1, GSM_RX, GSM_TX);
   delay(GSM_BOOT_WAIT_MS);          // modem needs time after power-up
 
   gsm_ready = gsmInit();
-#else
-  Serial.println(F("[GSM] Disabled (GSM_ENABLED false) - SMS is sent over WiFi via the backend"));
-  gsm_ready = false;
-  gsm_data.module_found = false;
-#endif
 
   if (gsm_ready) {
     Serial.println(F("[GSM] OK - Ready to send emergency SMS"));
@@ -2558,9 +2541,26 @@ bool gsmInit() {
   return true;
 }
 
-/* Periodic lightweight health check (does not block the sensor loop). */
+/* Periodic lightweight health check (does not block the sensor loop).
+ * Also recovers a modem that was slow at boot: if it did not answer AT then,
+ * probe once (1 s max); once it answers, set text mode and let the CREG check
+ * below mark it registered. Without this, a SIM800L that needed longer than
+ * the boot window stayed unused until the next reset. */
 bool gsmCheckHealth(bool verbose) {
-  if (!gsm_data.module_found) return false;
+  if (!gsm_data.module_found) {
+    if (!gsmExpect("AT", "OK", 1000)) return false;
+    Serial.println(F("[GSM] Modem now responding - configuring SMS text mode"));
+    gsm_data.module_found = true;
+    gsmSendAT("ATE0", 1000);
+    gsmSendAT("AT+CMGF=1", 1000);
+    gsmSendAT("AT+CSCS=\"GSM\"", 1000);
+    gsmSendAT("AT+CNMI=2,1,0,0,0", 1000);
+  }
+
+  if (!gsm_data.sim_ready) {
+    gsm_data.sim_ready = (gsmSendAT("AT+CPIN?", 1500).indexOf("READY") != -1);
+    if (!gsm_data.sim_ready) return false;
+  }
 
   String csq = gsmSendAT("AT+CSQ", 1500);
   int idx = csq.indexOf("+CSQ:");
@@ -2570,6 +2570,10 @@ bool gsmCheckHealth(bool verbose) {
 
   String creg = gsmSendAT("AT+CREG?", 1500);
   gsm_data.network_reg = (creg.indexOf(",1") != -1 || creg.indexOf(",5") != -1);
+  if (gsm_data.network_reg && !gsm_ready) {
+    gsm_ready = true;
+    Serial.println(F("[GSM] Registered on network - SMS alerts now available"));
+  }
 
   if (verbose) {
     Serial.print(F("[GSM] CSQ="));
@@ -2585,6 +2589,12 @@ bool gsmCheckHealth(bool verbose) {
  * in one or two SMS segments, and leads with the most important
  * information in case only the notification preview is seen.
  */
+// SIM800L text mode sends ONE SMS of at most 160 GSM characters; it does not
+// split longer text into a multi-part message. The previous layout reached
+// ~164 characters with a GPS fix (location printed twice), so the alert could
+// fail or be cut off exactly when the location mattered.
+#define SMS_MAX_CHARS 160
+
 String buildAlertMessage(int severity_class, float confidence, float peak_g) {
   String msg = "";
 
@@ -2597,24 +2607,31 @@ String buildAlertMessage(int severity_class, float confidence, float peak_g) {
   }
 
   msg += "Sentinel unit alert\n";
-  msg += "Peak: " + String(peak_g, 1) + "g\n";
-  if (confidence > 0.0f) {   // threshold-only / local classifications have no model confidence
-    msg += "Confidence: " + String((int)(confidence * 100)) + "%\n";
+  msg += "Peak: " + String(peak_g, 1) + "g";
+  // Threshold-only (rc_demo) and on-device classifications carry no model
+  // confidence; printing "0%" would read as "not an accident".
+  if (confidence > 0.0f) {
+    msg += " Conf: " + String((int)(confidence * 100)) + "%";
   }
+  msg += "\n";
 
   if (gps_data.has_lock && gps_data.valid) {
-    msg += "Loc: " + String(gps_data.latitude, 6) + "," + String(gps_data.longitude, 6) + "\n";
+    // The map link carries the coordinates, so they are not repeated.
     msg += "https://maps.google.com/?q=";
     msg += String(gps_data.latitude, 6);
     msg += ",";
     msg += String(gps_data.longitude, 6);
     msg += "\n";
-    msg += "Sats: " + String(gps_data.satellites) + "\n";
+    msg += "Sats: " + String(gps_data.satellites) + " ";
   } else {
     msg += "Loc: GPS FIX UNAVAILABLE\n";
   }
 
-  msg += "Uptime: " + String(millis() / 1000) + "s";
+  msg += "Up: " + String(millis() / 1000) + "s";
+
+  if (msg.length() > SMS_MAX_CHARS) {   // guard: never exceed one SMS
+    msg = msg.substring(0, SMS_MAX_CHARS);
+  }
   return msg;
 }
 
@@ -2692,82 +2709,30 @@ bool gsmSendSMSTo(const char* number, const String& message) {
   return false;
 }
 
-/*
- * SMS over WiFi: POST {phone, message, device_id} to the backend, which sends
- * it through its SMS provider. True only on HTTP 200 (provider accepted it).
- * 4xx is not retried: 403 = number not allowed on the backend, 429 = rate
- * limit. 503 = no SMS provider configured on the backend.
- */
-bool smsViaBackend(const char* number, const String& message) {
-  if (!WiFi.isConnected()) {
-    Serial.println(F("[SMS] WiFi not connected - cannot use backend SMS"));
+/* Broadcast the alert to every configured emergency contact. */
+bool sendEmergencySMS(int severity_class, float confidence, float peak_g) {
+  if (!gsm_data.module_found) {
+    Serial.println(F("[GSM] Cannot send SMS - modem unavailable"));
     return false;
   }
 
-  JsonDocument doc;
-  doc["phone"] = number;
-  doc["message"] = message;
-  doc["device_id"] = DEVICE_ID;
-  String body;
-  serializeJson(doc, body);
-
-  String url = String(BACKEND_URL) + "/api/v1/sms/send";
-  for (uint8_t attempt = 1; attempt <= 2; attempt++) {
-    xSemaphoreTake(http_mutex, portMAX_DELAY);
-    HTTPClient http;
-    http.setTimeout(HTTP_TIMEOUT_MS);
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-API-Key", API_KEY);
-    int code = http.POST(body);
-    String resp = http.getString();
-    http.end();
-    xSemaphoreGive(http_mutex);
-
-    Serial.print(F("[SMS] "));
-    Serial.print(number);
-    Serial.print(F(" via backend -> HTTP "));
-    Serial.print(code);
-    Serial.print(F("  "));
-    Serial.println(resp.substring(0, 180));
-
-    if (code == 200) return true;
-    if ((code >= 400 && code < 500) || code == 503) return false;
-    if (attempt == 1) delay(2000);   // transport error / 5xx: retry once
-  }
-  return false;
-}
-
-/* Broadcast the alert to every configured emergency contact.
- * WiFi backend first; the SIM800L only as a fallback when enabled and alive. */
-bool sendEmergencySMS(int severity_class, float confidence, float peak_g) {
   String message = buildAlertMessage(severity_class, confidence, peak_g);
 
-  Serial.println(F("[SMS] ---- Emergency message ----"));
+  Serial.println(F("[GSM] ---- Emergency message ----"));
   Serial.println(message);
-  Serial.println(F("[SMS] ---------------------------"));
+  Serial.println(F("[GSM] ---------------------------"));
 
   bool any_sent = false;
   for (uint8_t i = 0; i < NUM_EMERGENCY_CONTACTS; i++) {
-    bool sent = false;
-    if (SMS_VIA_BACKEND) {
-      sent = smsViaBackend(EMERGENCY_CONTACTS[i], message);
+    // One retry per contact — SMS is the last line of defence
+    if (gsmSendSMSTo(EMERGENCY_CONTACTS[i], message)) {
+      any_sent = true;
+    } else {
+      Serial.println(F("[GSM] Retrying once..."));
+      delay(2000);
+      if (gsmSendSMSTo(EMERGENCY_CONTACTS[i], message)) any_sent = true;
     }
-    if (!sent && gsm_data.module_found) {
-      Serial.println(F("[SMS] Falling back to GSM modem"));
-      sent = gsmSendSMSTo(EMERGENCY_CONTACTS[i], message);
-      if (!sent) {
-        Serial.println(F("[GSM] Retrying once..."));
-        delay(2000);
-        sent = gsmSendSMSTo(EMERGENCY_CONTACTS[i], message);
-      }
-      delay(1000);   // small gap between recipients on the modem
-    }
-    if (!sent) {
-      Serial.print(F("[SMS] FAILED to notify "));
-      Serial.println(EMERGENCY_CONTACTS[i]);
-    }
-    any_sent = any_sent || sent;
+    delay(1000);   // small gap between recipients
   }
   return any_sent;
 }
@@ -2981,9 +2946,10 @@ void loop() {
   }
 
   // ─────────────────────────────────────────────────────────────
-  // Periodic GSM health check (every 60 s, cheap)
+  // Periodic GSM health check (every 60 s, cheap). Runs even when boot-time
+  // init failed, so a modem that powers up or registers late is picked up.
   // ─────────────────────────────────────────────────────────────
-  if (gsm_ready && (now - last_gsm_health >= 60000)) {
+  if (now - last_gsm_health >= 60000) {
     gsmCheckHealth(false);
     last_gsm_health = now;
   }
@@ -3058,8 +3024,8 @@ void processCrash() {
                     (severity == SEVERITY_MODERATE && SMS_ON_MODERATE);
 
   if (should_sms) {
-    if (SMS_VIA_BACKEND || gsm_data.module_found) {
-      Serial.println(F("[SMS] Dispatching emergency SMS..."));
+    if (gsm_data.module_found) {
+      Serial.println(F("[GSM] Dispatching emergency SMS..."));
       bool sent = sendEmergencySMS(severity,
                                    last_crash_result.confidence,
                                    last_crash_result.peak_magnitude_g);
@@ -3071,19 +3037,19 @@ void processCrash() {
           delay(160);
           noTone(BUZZER_PIN);
         }
-        Serial.println(F("[SMS] Emergency contacts notified"));
+        Serial.println(F("[GSM] Emergency contacts notified"));
       } else {
-        Serial.println(F("[SMS] WARNING: could not notify any contact"));
+        Serial.println(F("[GSM] WARNING: could not notify any contact"));
       }
 
-      // Escalate to a voice call on SEVERE (GSM only; skipped while the modem is down)
-      if (gsm_data.module_found && severity == SEVERITY_SEVERE && CALL_ON_SEVERE &&
+      // Escalate to a voice call on SEVERE
+      if (severity == SEVERITY_SEVERE && CALL_ON_SEVERE &&
           NUM_EMERGENCY_CONTACTS > 0) {
         gsmPlaceEmergencyCall(EMERGENCY_CONTACTS[0]);
       }
 
     } else {
-      Serial.println(F("[SMS] WARNING: no SMS transport available - no SMS sent"));
+      Serial.println(F("[GSM] WARNING: modem unavailable - no SMS sent"));
     }
   } else {
     Serial.println(F("[GSM] Normal severity - no SMS required"));
